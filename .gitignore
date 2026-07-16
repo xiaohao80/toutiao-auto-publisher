@@ -1,0 +1,22 @@
+# Browser data (persistent login)
+*-browser-data/
+browser-data/
+
+# Debug screenshots
+debug_*.png
+*.debug.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
