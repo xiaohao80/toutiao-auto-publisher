@@ -2,7 +2,7 @@
 name: toutiao-auto-publisher
 description: 今日头条自动发布工具 — 检查登录、扫码登录、发布图文文章到头条号，支持正文配图、封面图、声明勾选、草稿模式。触发词："发头条"、"头条发布"、"发布到头条"。
 version: 1.6.1
-author: 摸鱼哥（咸鱼观天下）
+author: 摸鱼哥（摸鱼观天下）
 homepage: https://github.com/xiaohao80
 ---
 
@@ -194,8 +194,8 @@ python {SKILL_DIR}/toutiao_publisher.py \
 
 **摸鱼哥** — 8年Java程序员，业余搞科技评论和AI自动化工具。
 
-- 微信公众号：**咸鱼观天下**（科技吐槽 + AI踩坑日记）
+- 微信公众号：**摸鱼观天下**（科技吐槽 + AI踩坑日记）
 - GitHub：[@xiaohao80](https://github.com/xiaohao80)（Star一下，下次更新更快）
-- 小红书：搜「咸鱼观天下」
+- 小红书：搜「摸鱼观天下」
 
 这个 Skill 是摸鱼哥开发并开源的，如果对你有帮助，来个 Star 或关注公众号支持一下！
