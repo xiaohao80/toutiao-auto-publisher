@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-今日头条自动发布脚本 (toutiao_publisher.py)
+今日头条自动发布脚本 (toutiao_publisher.py) v1.6.1
 基于 Playwright 实现浏览器自动化，持久化登录态，支持图文文章发布。
+v1.6.1: 封面上传前先清除自动提取的封面（用户发现正文配图会自动提取封面排在前面），支持--browser-data小号测试
+v1.6.0: 封面上传改为 API直传+React注入，绕过不稳定UI选择器
 
 用法:
   # 检查登录状态
@@ -44,11 +46,12 @@ DEBUG_DIR = os.getcwd()
 class ToutiaoBrowser:
     """今日头条浏览器自动化管理器"""
 
-    def __init__(self, debug_dir=None):
+    def __init__(self, debug_dir=None, browser_data_dir=None):
         self.playwright = None
         self.context = None
         self.page = None
         self.debug_dir = debug_dir or DEBUG_DIR
+        self.browser_data_dir = browser_data_dir or BROWSER_DATA_DIR
 
     def _debug_path(self, filename):
         return os.path.join(self.debug_dir, filename)
@@ -60,11 +63,11 @@ class ToutiaoBrowser:
         from playwright.async_api import async_playwright
         from playwright_stealth import Stealth
 
-        os.makedirs(BROWSER_DATA_DIR, exist_ok=True)
+        os.makedirs(self.browser_data_dir, exist_ok=True)
 
         # 清理锁文件
         for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-            lock_path = os.path.join(BROWSER_DATA_DIR, lock_file)
+            lock_path = os.path.join(self.browser_data_dir, lock_file)
             if os.path.exists(lock_path):
                 try:
                     os.remove(lock_path)
@@ -74,7 +77,7 @@ class ToutiaoBrowser:
         self.playwright = await async_playwright().start()
 
         self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=BROWSER_DATA_DIR,
+            user_data_dir=self.browser_data_dir,
             headless=headless,
             viewport=VIEWPORT,
             timeout=DEFAULT_TIMEOUT,
@@ -266,10 +269,13 @@ class ToutiaoBrowser:
         await asyncio.sleep(1)
         await self.screenshot("after_content")
 
-        # 4. 设置封面（v1.5.1：封面失败不阻断，头条自动用正文第一张配图当封面）
+        # 4. 设置封面（v1.6.1：先清除自动提取的封面，再API直传+React注入）
         if cover_path:
             print("  [4/8] 设置封面...")
             await self.hide_ai_drawer()
+            # v1.6.1: 先清除头条自动从正文图片提取的封面
+            # 用户发现：正文有配图时头条自动提取封面排在前面，自定义封面被挤到后面
+            await self._clear_auto_covers()
             try:
                 await self._upload_cover(cover_path)
                 await asyncio.sleep(2)
@@ -641,23 +647,432 @@ class ToutiaoBrowser:
         await self.hide_ai_drawer()
         await asyncio.sleep(0.5)
 
+    async def _clear_auto_covers(self):
+        """清除头条自动从正文图片提取的封面（v1.6.1 新增）
+
+        用户发现：正文有配图时，头条会自动提取正文图片作为封面候选，
+        自动提取的封面排在前面（位置0），自定义上传的封面被挤到后面。
+        只有位置0的图片才是实际封面，所以必须先删除自动提取的封面。
+
+        策略：
+        1. DOM方式：找封面区域的删除按钮并点击
+        2. 如果DOM方式失败，输出诊断信息
+        """
+        # 等待自动提取完成（头条需要几秒处理正文图片）
+        await asyncio.sleep(2)
+
+        result = await self.page.evaluate("""
+            async () => {
+                const log = [];
+
+                // 1. 找封面区域
+                const coverSelectors = [
+                    '.article-cover-images',
+                    '.article-cover',
+                    '[class*="article-cover"]',
+                    '[class*="cover-image"]',
+                    '[class*="cover-upload"]'
+                ];
+
+                let coverArea = null;
+                for (const sel of coverSelectors) {
+                    coverArea = document.querySelector(sel);
+                    if (coverArea) {
+                        log.push('cover area: ' + sel);
+                        break;
+                    }
+                }
+                if (!coverArea) {
+                    return {found: false, log, msg: 'no cover area found'};
+                }
+
+                // 2. 统计封面图片
+                const imgs = coverArea.querySelectorAll('img');
+                log.push('cover imgs: ' + imgs.length);
+                for (const img of imgs) {
+                    log.push('  img src: ' + (img.src || '').substring(0, 80));
+                }
+
+                // 3. 找删除按钮（多种选择器，头条UI可能变版）
+                // v1.6.1 关键发现：删除按钮实际是 <i class="article-cover-delete">
+                const delSelectors = [
+                    'i.article-cover-delete',  // v1.6.1 验证过的精确选择器
+                    '.article-cover-delete',   // 同上
+                    '[class*="cover-delete"]',  // 扩展匹配
+                    '[class*="delete"]', '[class*="Delete"]',
+                    '[class*="close"]', '[class*="Close"]',
+                    '[class*="remove"]', '[class*="Remove"]',
+                    '[class*="del-btn"]', '[class*="delete-btn"]',
+                    '.icon-close', '.icon-delete',
+                    'span[class*="close"]', 'i[class*="close"]',
+                    'button[class*="close"]', 'button[class*="delete"]'
+                ];
+
+                let deleteBtns = [];
+                for (const sel of delSelectors) {
+                    const btns = coverArea.querySelectorAll(sel);
+                    btns.forEach(btn => {
+                        // 排除 AI 蒙层和抽屉的按钮
+                        if (!btn.closest('.ai-assistant-drawer') &&
+                            !btn.closest('.byte-drawer') &&
+                            !btn.closest('.byte-modal') &&
+                            !btn.closest('.byte-drawer-mask')) {
+                            deleteBtns.push(btn);
+                        }
+                    });
+                }
+                log.push('delete btns found: ' + deleteBtns.length);
+
+                // 4. 点击删除按钮（逐个点击，每个之间等待）
+                let cleared = 0;
+                for (const btn of [...deleteBtns]) {
+                    try {
+                        // hover 触发按钮显示（有些删除按钮需要 hover 才出现）
+                        btn.dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
+                        btn.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+                        await new Promise(r => setTimeout(r, 200));
+                        btn.click();
+                        cleared++;
+                        await new Promise(r => setTimeout(r, 500));
+                    } catch(e) {
+                        log.push('click err: ' + e.message);
+                    }
+                }
+
+                return {
+                    found: true,
+                    cleared,
+                    log,
+                    imgCount: imgs.length,
+                    delBtnCount: deleteBtns.length,
+                    coverHTML: coverArea.innerHTML.substring(0, 2000)
+                };
+            }
+        """)
+
+        if result.get('cleared', 0) > 0:
+            print(f"    [清除] 删除了 {result['cleared']} 个自动提取的封面")
+            await asyncio.sleep(1)
+        else:
+            print(f"    [清除] 未找到可删除的自动封面")
+            # 诊断输出
+            for l in result.get('log', []):
+                print(f"    [诊断] {l}")
+            if result.get('coverHTML'):
+                print(f"    [诊断] 封面区域HTML: {result['coverHTML'][:300]}")
+
     async def _upload_cover(self, cover_path):
-        """上传封面图 — 走真实 UI 流程（点击+号 → 弹窗 → set_input_files → 确定）
+        """v1.6.1: 先清除自动提取的封面，再用真实UI流程上传
 
-        关键发现：头条封面的"+号"对所有合成事件（click/双击/mousedown/pointer/keyboard）免疫，
-        但 AI 助手 drawer 蒙层被清掉后真实 click 就能响应，弹窗里就有真实的 file input。
+        v1.6.0 方案B失败教训：
+        - React fiber 注入 onChange(string) 只能更新UI临时state
+        - 自动保存时头条还是用正文第一张图当封面
+        - 草稿里实际保存的是"正文配图1"，不是自定义封面
 
-        真实上传链路（头条内部）：
-        1. set_input_files → POST /mp/agw/article_material/photo/spice/image?upload_source=20020003 (multipart)
-        2. → POST /mp/agw/article_material/photo/info?app_id=1231 (JSON {uris: ["..."]})
-        3. 头条内部把 CDN URL 注入 onChange（不需要我们手动）
-        4. 点"确定"按钮 → 关闭弹窗
+        v1.6.1 新方案（用户手动经验）：
+        1. 先清掉头条自动从正文提取的封面（_clear_auto_covers）
+        2. 用真实UI流程上传（点击+号 → 选文件 → 点确定）
+        3. 走头条自己跑的状态更新路径，确保封面持久化
         """
         abs_path = os.path.abspath(cover_path)
         if not os.path.exists(abs_path):
             print(f"    [警告] 封面图不存在: {abs_path}")
             return
 
+        # === 方案A: 真实UI流程（主方案，v1.6.1）===
+        # 用户手动操作经验：先删自动提取的封面，再点+号上传自定义封面
+        try:
+            print("    [A-1] 真实UI流程上传封面（点+号 → 选文件 → 确定）...")
+            await self._upload_cover_ui(abs_path)
+            print("    [A-2] 封面上传完成（走头条原生状态更新路径）")
+            await asyncio.sleep(2)
+            await self.screenshot("after_cover_ui")
+            return
+        except Exception as e:
+            print(f"    [A] UI流程失败: {e}")
+
+        # === 降级: API直传+React注入（v1.6.0方案，已知只更新UI不持久化）===
+        print("    降级到API+React注入方案（v1.6.0，仅作为UI显示，最后兜底靠头条系统用正文首图）...")
+        try:
+            upload_data = await self._upload_cover_to_cdn(abs_path)
+            if upload_data:
+                cdn_url = upload_data.get('image_url')
+                image_uri = upload_data.get('image_uri')
+                print(f"    CDN URL: {cdn_url[:70]}...")
+                await self._inject_cover_via_react(cdn_url, image_uri)
+        except Exception as e:
+            print(f"    [降级] API方案也失败: {e}")
+            print(f"    头条将自动用正文第一张配图作为封面")
+
+    async def _upload_cover_to_cdn(self, cover_path):
+        """上传封面到头条图床（spice API, upload_source=20020003）
+
+        与正文图片上传（_upload_images_to_cdn）使用相同的 spice API，
+        但 upload_source 不同：正文=20020002，封面=20020003
+
+        返回: {"image_url": "https://image-tt-private.toutiao.com/...", "image_uri": "..."}
+        """
+        import base64
+        with open(cover_path, 'rb') as f:
+            data = f.read()
+
+        img_b64 = {
+            'name': os.path.basename(cover_path),
+            'b64': base64.b64encode(data).decode('utf-8'),
+            'type': 'image/png'
+        }
+
+        result = await self.page.evaluate("""
+            async (img) => {
+                const bin = atob(img.b64);
+                const bytes = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                const blob = new Blob([bytes], {type: img.type});
+                const file = new File([blob], img.name, {type: img.type});
+                const fd = new FormData();
+                fd.append('image', file);
+                fd.append('upload_source', '20020003');
+                fd.append('aid', '1231');
+                fd.append('device_platform', 'web');
+                try {
+                    const resp = await fetch('https://mp.toutiao.com/spice/image?upload_source=20020003&aid=1231&device_platform=web', {
+                        method: 'POST', body: fd, credentials: 'include'
+                    });
+                    const data = await resp.json();
+                    return {status: resp.status, data: data};
+                } catch (e) {
+                    return {error: e.message};
+                }
+            }
+        """, img_b64)
+
+        if result.get('error'):
+            print(f"    [错误] spice API fetch失败: {result['error']}")
+            return None
+
+        resp_data = result.get('data', {})
+        if resp_data.get('code') == 0:
+            return resp_data.get('data')
+        else:
+            print(f"    [错误] spice API返回非0: {json.dumps(resp_data, ensure_ascii=False)[:200]}")
+            return None
+
+    async def _inject_cover_via_react(self, cdn_url, image_uri):
+        """注入封面CDN URL到封面组件的React state
+
+        v1.6.0 关键发现（2026-07-17）：
+        - 头条用的是旧版 React 16/17 格式
+        - React 内部 key 是 `__reactInternalInstance$<suffix>`，不是 React 18 的 `__reactFiber$`
+        - **事件处理函数不在 fiber.memoizedProps 里，而在 el.__reactEventHandlers$<suffix> 这个独立属性里**
+        - 这是为什么之前找 onTypeChange 调了没生效（那可能是控制单图/三图切换的 radio 回调）
+
+        策略：
+        1. 找到封面容器元素（.article-cover-images 等）
+        2. 获取其 __reactInternalInstance（不是 __reactFiber）
+        3. 向上遍历 fiber 树，找到合适的回调
+        4. 函数回调可能在两个地方：fiber.memoizedProps 或 el.__reactEventHandlers
+        5. 调用回调时尝试多种参数格式
+        """
+        cover_data = {
+            'url': cdn_url,
+            'uri': image_uri,
+            'web_uri': image_uri,
+            'image_url': cdn_url,
+            'image_uri': image_uri,
+        }
+
+        result = await self.page.evaluate("""
+            async (coverData) => {
+                const cdnUrl = coverData.url;
+                const uri = coverData.uri;
+
+                // 1. 找封面相关元素
+                const selectors = [
+                    '.article-cover-images',
+                    '.article-cover-add',
+                    '.article-cover',
+                    '[class*="article-cover"]',
+                    '[class*="cover-upload"]'
+                ];
+
+                let targetEl = null;
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        // 找有 React internals 的元素
+                        const keys = Object.keys(el);
+                        if (keys.some(k => k.startsWith('__reactInternalInstance') || k.startsWith('__reactFiber'))) {
+                            targetEl = el;
+                            break;
+                        }
+                    }
+                    if (targetEl) break;
+                }
+                if (!targetEl) return {error: 'no cover element with React internals', selectors: selectors};
+
+                // 2. 找到 fiber key（旧版 React 16/17 是 __reactInternalInstance）
+                const fiberKey = Object.keys(targetEl).find(k =>
+                    k.startsWith('__reactInternalInstance') || k.startsWith('__reactFiber'));
+                if (!fiberKey) return {error: 'no fiber key', className: targetEl.className};
+
+                // 3. 收集目标元素及其祖先元素的所有 event handlers
+                //    旧版 React 的 event handlers 在 __reactEventHandlers 属性里
+                let fiber = targetEl[fiberKey];
+                const allHandlers = [];  // [{depth, key, fn, source}]
+
+                let currEl = targetEl;
+                for (let depth = 0; depth < 20 && fiber; depth++) {
+                    // 检查当前元素是否有 __reactEventHandlers
+                    const handlerKey = Object.keys(currEl).find(k => k.startsWith('__reactEventHandlers'));
+                    if (handlerKey) {
+                        const handlers = currEl[handlerKey];
+                        if (handlers && typeof handlers === 'object') {
+                            for (const [k, v] of Object.entries(handlers)) {
+                                if (typeof v === 'function') {
+                                    allHandlers.push({depth, key: k, fn: v, source: 'eventHandlers'});
+                                }
+                            }
+                        }
+                    }
+
+                    // 也检查 fiber.memoizedProps 里的函数
+                    const props = fiber.memoizedProps || {};
+                    for (const [k, v] of Object.entries(props)) {
+                        if (typeof v === 'function' && !allHandlers.find(h => h.key === k)) {
+                            allHandlers.push({depth, key: k, fn: v, source: 'memoizedProps'});
+                        }
+                    }
+
+                    // 移到父 fiber
+                    fiber = fiber.return;
+                    // 旧版 React fiber 链上不直接有对应的 DOM 元素
+                    // 但我们可以用 _currentElement 关联
+                    if (fiber && fiber.stateNode && fiber.stateNode !== currEl) {
+                        currEl = fiber.stateNode;
+                    }
+                }
+
+                if (allHandlers.length === 0) {
+                    return {error: 'no callbacks found in fiber tree'};
+                }
+
+                // 4. 给每个 callback 打分，排序
+                //    优先：cover + image/change
+                //    其次：cover 单独
+                //    再次：image/change
+                //    排除：纯 Type 相关的（可能是控制单图/三图）
+                function scoreHandler(h) {
+                    const k = h.key.toLowerCase();
+                    let score = 0;
+                    if (k.includes('cover') && (k.includes('change') || k.includes('image') || k.includes('upload'))) score += 100;
+                    else if (k.includes('cover') && k.includes('success')) score += 80;
+                    else if (k.includes('cover') && k.includes('select')) score += 70;
+                    else if (k === 'onchange' || k === 'onupload' || k === 'onsuccess') score += 60;
+                    else if (k.includes('image') && k.includes('change')) score += 50;
+                    else if (k.includes('change')) score += 30;
+                    else if (k.includes('cover')) score += 20;
+
+                    // 排除：Type 相关（控制单图/三图切换）
+                    if (k.includes('type')) score -= 200;
+                    // 排除：radio 相关
+                    if (k.includes('radio')) score -= 200;
+                    // 排除：dialog/drawer 相关
+                    if (k.includes('dialog') || k.includes('drawer') || k.includes('modal')) score -= 100;
+                    // 优先：更浅的 depth
+                    score -= h.depth * 2;
+                    // 优先：eventHandlers 源的
+                    if (h.source === 'eventHandlers') score += 5;
+
+                    return score;
+                }
+
+                allHandlers.sort((a, b) => scoreHandler(b) - scoreHandler(a));
+
+                // 5. 按顺序尝试每个 callback
+                const attempts = [];
+                let success = false;
+                let bestMethod = null;
+
+                // 限制尝试数量（避免试太多浪费时间）
+                const toTry = allHandlers.slice(0, 8);
+
+                for (const h of toTry) {
+                    // 尝试不同参数格式
+                    const argFormats = [
+                        {name: 'string', val: cdnUrl},
+                        {name: 'url_obj', val: {url: cdnUrl, uri: uri, web_uri: uri, image_url: cdnUrl, image_uri: uri}},
+                        {name: 'full', val: coverData},
+                        {name: 'array', val: [coverData]},
+                    ];
+
+                    for (const fmt of argFormats) {
+                        try {
+                            h.fn(fmt.val);
+                            attempts.push({depth: h.depth, key: h.key, source: h.source, arg: fmt.name, ok: true});
+                            if (!success) {
+                                success = true;
+                                bestMethod = `fiber[${h.depth}].${h.key}(${fmt.name}) [${h.source}]`;
+                            }
+                            // 成功一次就 break（一个 callback 调用一次就够）
+                            break;
+                        } catch(e) {
+                            attempts.push({depth: h.depth, key: h.key, source: h.source, arg: fmt.name, err: e.message.substring(0, 50)});
+                        }
+                    }
+                }
+
+                // 6. 验证封面是否被设置
+                if (success) {
+                    await new Promise(r => setTimeout(r, 1500));
+
+                    // 检查 .article-cover-images 里是否有 img 元素
+                    const previewImg = document.querySelector(
+                        '.article-cover-images img, .article-cover img[src*="toutiao"], [class*="cover"] img[src*="toutiao"]'
+                    );
+                    const hasPreview = previewImg && previewImg.src;
+
+                    // 也检查 .article-cover-images 的 background-image
+                    const coverImages = document.querySelector('.article-cover-images');
+                    let bgImage = null;
+                    if (coverImages) {
+                        const style = window.getComputedStyle(coverImages);
+                        bgImage = style.backgroundImage;
+                    }
+
+                    return {
+                        success: true,
+                        method: bestMethod,
+                        hasPreview: hasPreview,
+                        previewSrc: previewImg ? previewImg.src.substring(0, 80) : null,
+                        bgImage: bgImage && bgImage !== 'none' ? bgImage.substring(0, 80) : null,
+                        attempts: attempts,
+                        handlersFound: allHandlers.length,
+                        topScored: allHandlers.slice(0, 3).map(h => ({key: h.key, score: scoreHandler(h), source: h.source}))
+                    };
+                }
+
+                return {error: 'no callback succeeded', attempts: attempts, topScored: allHandlers.slice(0, 5).map(h => ({key: h.key, score: scoreHandler(h), source: h.source}))};
+            }
+        """, cover_data)
+
+        return result
+
+    async def _upload_cover_ui(self, abs_path):
+        """真实UI流程上传封面（v1.6.1 关键修复）
+
+        流程（用户手动操作经验）：
+        1. 清除自动提取的封面（_clear_auto_covers）
+        2. 点击封面+号 → 打开侧边抽屉（mp-ic-img-drawer）
+        3. 抽屉默认在"正文图片"tab，需要切到"上传图片"tab才有file input
+        4. set_input_files 上传文件
+        5. 等"已上传"提示
+        6. 点确定
+
+        注意：
+        - 封面图尺寸建议大于 672*462，最小 452*352
+        - 抽屉是 byte-drawer.primary-drawer.mp-ic-img-drawer
+        - "上传图片" tab 是 .byte-tabs-header-title
+        """
         # 1. 滚动到封面区
         await self.page.evaluate("""
             () => {
@@ -667,8 +1082,7 @@ class ToutiaoBrowser:
         """)
         await asyncio.sleep(0.5)
 
-        # 2. 彻底清掉 AI 助手/抽屉蒙层（关键！否则点击会被拦截）
-        #    注意：.ai-assistant-drawer 是 wrapper, .byte-drawer-mask 是蒙层，都要删
+        # 2. 清 AI 蒙层（两个都要删：mask + wrapper）
         await self.page.evaluate("""
             () => {
                 document.querySelectorAll(
@@ -681,51 +1095,106 @@ class ToutiaoBrowser:
         """)
         await asyncio.sleep(0.3)
 
-        # 3. 点击 +号，触发图片库弹窗
-        print(f"    [1/4] click 封面+号")
-        try:
-            await self.page.locator('.article-cover-add').first.click(timeout=5000)
-        except Exception as e:
-            raise Exception(f"click +号失败: {e}")
+        # 3. 点击 +号（v1.6.1：必须先清自动封面才有这个按钮）
+        print(f"    [UI-1] click 封面+号 (.article-cover-add)")
+        clicked = False
+        for sel in ['.article-cover-add', '[class*="cover-add"]']:
+            try:
+                el = self.page.locator(sel).first
+                await el.wait_for(state="visible", timeout=5000)
+                await el.click(timeout=5000)
+                clicked = True
+                break
+            except:
+                continue
+        if not clicked:
+            raise Exception(".article-cover-add 选择器失败（可能未清除自动封面）")
 
-        # 4. 等弹窗出现，找里面的 file input 并 set_input_files
-        print(f"    [2/4] 等弹窗 file input")
-        try:
-            file_input = self.page.locator('input[type="file"][accept*="image"]').first
-            await file_input.wait_for(state="attached", timeout=10000)
-            await file_input.set_input_files(abs_path)
-            print(f"    [3/4] 已上传文件: {os.path.basename(abs_path)}")
-        except Exception as e:
-            raise Exception(f"set_input_files 失败: {e}")
+        # 4. 等待抽屉打开
+        print(f"    [UI-2] 等待抽屉打开...")
+        await self.page.wait_for_selector(
+            '.byte-drawer.mp-ic-img-drawer, [class*="mp-ic-img-drawer"]',
+            state="visible",
+            timeout=10000
+        )
+        await asyncio.sleep(1)
 
-        # 5. 等头条内部上传完成（弹窗里出现"已上传"文字）
-        print(f"    [4/4] 等头条内部上传完成")
-        try:
-            # 弹窗里出现"已上传 N 张" 文字说明图已传到头条图床
-            await self.page.wait_for_function(
-                """
+        # 5. 切换到"上传图片"tab
+        print(f"    [UI-3] 切换到'上传图片'tab")
+        tab_clicked = False
+        tab_selectors = [
+            '.byte-tabs-header-title:has-text("上传图片")',
+            'div:has-text("上传图片")',
+            '[class*="tab"]:has-text("上传图片")',
+        ]
+        for sel in tab_selectors:
+            try:
+                el = self.page.locator(sel).first
+                if await el.is_visible():
+                    await el.click(timeout=3000)
+                    tab_clicked = True
+                    print(f"      点击tab: {sel}")
+                    break
+            except:
+                continue
+        if not tab_clicked:
+            # 兜底：找所有byte-tabs-header-title，按文字匹配
+            await self.page.evaluate("""
                 () => {
-                    const text = document.body.innerText || '';
-                    return /已上传\\s*\\d+\\s*张/.test(text);
+                    const titles = document.querySelectorAll('.byte-tabs-header-title');
+                    for (const t of titles) {
+                        if (t.textContent.trim() === '上传图片') {
+                            t.click();
+                            return true;
+                        }
+                    }
+                    return false;
                 }
-                """,
+            """)
+            print(f"      JS点击tab: 上传图片")
+        await asyncio.sleep(1)
+
+        # 6. set_input_files
+        print(f"    [UI-4] set_input_files")
+        file_input = self.page.locator('input[type="file"]').first
+        await file_input.wait_for(state="attached", timeout=10000)
+        await file_input.set_input_files(abs_path)
+        print(f"    [UI-5] 已上传文件: {os.path.basename(abs_path)}")
+
+        # 7. 等"已上传"
+        try:
+            await self.page.wait_for_function(
+                """() => /已上传\\s*\\d+\\s*张/.test(document.body.innerText || '')""",
                 timeout=20000
             )
-            print(f"    封面图已上传到头条图床")
-        except Exception as e:
-            print(f"    [警告] 等'已上传'提示超时（可能上传慢）: {e}")
+            print(f"    [UI-6] 封面图已上传到头条图床")
+        except:
+            print(f"    [UI-6] 等'已上传'提示超时（可能已经在上传/不显示提示）")
 
-        # 6. 点"确定"按钮
+        # 8. 点确定（抽屉底部的确定按钮）
         try:
-            # 弹窗里有两个"确定"按钮在 DOM 里，visible 的那个才是真的
-            confirm_btn = self.page.locator('button:has-text("确定"):visible').last
+            confirm_btn = self.page.locator('.byte-drawer-footer button.btn-primary, .byte-drawer-footer button:has-text("确定")').first
+            await confirm_btn.wait_for(state="visible", timeout=5000)
             await confirm_btn.click(timeout=5000)
-            print(f"    已点确定按钮")
-        except Exception as e:
-            print(f"    [警告] 点确定失败（可能弹窗已自动关闭）: {e}")
+            print(f"    [UI-7] 已点确定按钮")
+        except:
+            # 兜底：找所有"确定"按钮
+            print(f"    [UI-7] 兜底找确定按钮...")
+            await self.page.evaluate("""
+                () => {
+                    const btns = document.querySelectorAll('button');
+                    for (const btn of btns) {
+                        if (btn.textContent.trim() === '确定' && btn.offsetParent !== null) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
 
         await asyncio.sleep(2)
-        await self.screenshot("after_cover")
+        await self.screenshot("after_cover_ui")
 
     async def _check_declarations(self):
         """勾选声明 — 头条用自研 checkbox 组件，必须用真实 click 事件
@@ -892,8 +1361,8 @@ class ToutiaoBrowser:
 
 # ===== CLI入口 =====
 
-async def cmd_check(debug_dir):
-    browser = ToutiaoBrowser(debug_dir=debug_dir)
+async def cmd_check(debug_dir, browser_data_dir=None):
+    browser = ToutiaoBrowser(debug_dir=debug_dir, browser_data_dir=browser_data_dir)
     try:
         await browser.start(headless=False)
         logged_in = await browser.check_login()
@@ -901,8 +1370,8 @@ async def cmd_check(debug_dir):
     finally:
         await browser.close()
 
-async def cmd_login(debug_dir):
-    browser = ToutiaoBrowser(debug_dir=debug_dir)
+async def cmd_login(debug_dir, browser_data_dir=None):
+    browser = ToutiaoBrowser(debug_dir=debug_dir, browser_data_dir=browser_data_dir)
     try:
         await browser.start(headless=False)
         success = await browser.login()
@@ -911,7 +1380,7 @@ async def cmd_login(debug_dir):
         await browser.close()
 
 async def cmd_publish(args):
-    browser = ToutiaoBrowser(debug_dir=args.debug_dir)
+    browser = ToutiaoBrowser(debug_dir=args.debug_dir, browser_data_dir=getattr(args, 'browser_data', None))
     try:
         await browser.start(headless=False)
 
@@ -946,6 +1415,7 @@ async def cmd_publish(args):
 def main():
     parser = argparse.ArgumentParser(description='今日头条自动发布工具')
     parser.add_argument('--debug-dir', default=None, help='调试截图目录（默认当前目录）')
+    parser.add_argument('--browser-data', default=None, help='浏览器数据目录（默认~/.toutiao-browser-data，小号用~/.toutiao-browser-data-small）')
 
     subparsers = parser.add_subparsers(dest='command')
 
@@ -973,9 +1443,9 @@ def main():
     debug_dir = args.debug_dir or os.getcwd()
 
     if args.command == 'check':
-        return asyncio.run(cmd_check(debug_dir))
+        return asyncio.run(cmd_check(debug_dir, args.browser_data))
     elif args.command == 'login':
-        return asyncio.run(cmd_login(debug_dir))
+        return asyncio.run(cmd_login(debug_dir, args.browser_data))
     elif args.command == 'publish':
         return asyncio.run(cmd_publish(args))
     else:

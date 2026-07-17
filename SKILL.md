@@ -1,7 +1,7 @@
 ---
 name: toutiao-auto-publisher
 description: 今日头条自动发布工具 — 检查登录、扫码登录、发布图文文章到头条号，支持正文配图、封面图、声明勾选、草稿模式。触发词："发头条"、"头条发布"、"发布到头条"。
-version: 1.5.1
+version: 1.6.1
 author: 摸鱼哥（咸鱼观天下）
 homepage: https://github.com/xiaohao80
 ---
@@ -42,6 +42,11 @@ python {SKILL_DIR}/toutiao_publisher.py login
 
 会弹出浏览器，在 mp.toutiao.com 页面扫码登录。登录态自动保存。
 
+> 💡 **小号测试**：用 `--browser-data` 参数指定独立浏览器数据目录，避免污染主号登录态
+> ```bash
+> python {SKILL_DIR}/toutiao_publisher.py --browser-data ~/.toutiao-browser-data-small login
+> ```
+
 ### 2. 检查登录状态
 
 ```bash
@@ -68,24 +73,38 @@ python {SKILL_DIR}/toutiao_publisher.py publish \
   --draft
 ```
 
-### 参数说明
+### 5. 小号发布
+
+```bash
+python {SKILL_DIR}/toutiao_publisher.py \
+  --browser-data ~/.toutiao-browser-data-small \
+  publish \
+  --title "文章标题" \
+  --content-file "article.md" \
+  --cover "cover.png" \
+  --images "img1.png" "img2.png" \
+  --draft
+```
+
+## 参数说明
 
 | 参数 | 必填 | 说明 |
 |------|------|------|
 | `--title` | 是 | 文章标题 |
 | `--content` | 否 | 文章正文（直接传入，与 --content-file 二选一） |
 | `--content-file` | 否 | 文章正文文件路径（支持 Markdown 格式） |
-| `--cover` | 否 | 封面图路径（建议 16:9 比例）。v1.5.1：封面失败不阻断流程，头条自动用正文第一张配图当封面 |
+| `--cover` | 否 | 封面图路径（建议 ≥672×462）。v1.6.1：先清除自动提取的封面再走真实UI流程上传，失败才降级API注入 |
 | `--images` | 否 | 正文配图路径（可多张，空格分隔） |
 | `--draft` | 否 | 存草稿（不直接发布） |
 | `--debug-dir` | 否 | 调试截图目录（默认当前目录） |
+| `--browser-data` | 否 | 浏览器数据目录（默认~/.toutiao-browser-data，小号用~/.toutiao-browser-data-small） |
 
 `{SKILL_DIR}` 为本 skill 所在目录，通常为 `~/.workbuddy/skills/toutiao-auto-publisher/`。
 
 ## 发布流程
 
 ```
-打开发布页 → 填标题 → 上传图片到头条图床拿CDN URL → 填正文（图片按[配图N]占位符穿插插入）→ 设置封面（失败则头条自动用正文配图）→ 勾选声明 → 发布/存草稿
+打开发布页 → 填标题 → 上传图片到头条图床拿CDN URL → 填正文（图片按[配图N]占位符穿插插入）→ 设置封面（先清除自动提取的封面 → 真实UI流程：点+号 → 切到「上传图片」tab → set_input_files → 点确定）→ 勾选声明 → 发布/存草稿
 ```
 
 每一步都会自动截图（`debug_toutiao_*.png`），方便排查问题。
@@ -110,7 +129,17 @@ python {SKILL_DIR}/toutiao_publisher.py publish \
 6. **AI助手浮层**：头条后台有AI抽屉的 `.byte-drawer-mask` 全屏蒙层会拦截点击，必须 `el.remove()` 彻底删除（`display:none` 无效）
 7. **声明勾选**：头条用自研 checkbox 组件，必须用真实 `click()` 事件触发 React 状态更新，JS设 `checked=true` 无效
 8. **草稿箱验证**：跳转 `/profile_v4/manage/draft` 检查"共 X 条"确认保存成功
-9. **封面上传：走真实 UI 流程（v1.3.0 方案，推荐）**：直接走头条的图片库弹窗——删 AI 蒙层（两个都要删）→ click `.article-cover-add` → 弹窗出现 → `set_input_files` 给弹窗里的 `input[type="file"]` → 等"已上传 N 张"文字出现 → 点"确定"按钮。**不要**用 base64 dataUrl 注入 onChange（v1.2.0 方案）—— 头条服务端只接受 CDN URL，dataUrl 在自动保存时会被丢弃
+9. **封面上传：清除自动封面 + 真实UI流程（v1.6.1 方案，推荐）**：基于用户手动操作经验，封面流程必须分两步走：
+   - **Step 1：清除自动提取的封面**（`_clear_auto_covers`）。当正文有配图时，头条会自动提取正文图片作为封面候选（最多4个），排在自定义封面前面。用户手动操作时也是先删这些自动封面。删除按钮是 `<i class="article-cover-delete">`（一个空文本的i元素）
+   - **Step 2：真实UI流程上传自定义封面**（`_upload_cover_ui`）：
+     1. 点击 `.article-cover-add`（+号按钮）
+     2. 等待抽屉 `.byte-drawer.mp-ic-img-drawer` 打开
+     3. **关键：切到「上传图片」tab**（`.byte-tabs-header-title:has-text("上传图片")`），默认在"正文图片"tab是没有 file input 的
+     4. `set_input_files` 上传文件
+     5. 等"已上传"提示
+     6. 点确定（`.byte-drawer-footer button.btn-primary`）
+   - **v1.6.0 失败教训**：React fiber 注入 `fiber[6].onChange(string)` 只能更新UI临时state，自动保存时头条还是用正文第一张图当封面。走真实UI流程才能让头条走自己的状态更新路径，封面才真正持久化
+   - **降级链**：清除+UI → API+React注入（仅UI显示，保存可能不持久）→ 头条系统兜底（正文首图）
 10. **正文配图穿插：spice API + execCommand insertHTML（v1.5.0 方案）**：
     - **不要再用工具栏按钮 [11] 插入图片**（v1.4.0 方案被废弃）—— 头条工具栏图片按钮有"一次性"限制：第一次点击后弹出 file input，上传完后再点不再弹出，导致配图2-4全部失败
     - **新方案**：
@@ -143,7 +172,23 @@ python {SKILL_DIR}/toutiao_publisher.py publish \
 12. **ProseMirror view 找不到**（v1.4.0 调研过程）：Syl 编辑器的 `div.ProseMirror` 只有 `pmViewDesc` 属性（没有 `view`）。`pmViewDesc.parent` 为 null（只有一层）。React fiber 向上/向下遍历 stateNode/memoizedState 都没有 dispatch 函数。**结论：无法从 DOM 直接拿到 ProseMirror EditorView**，必须改用其他机制（execCommand 或 paste event）
 13. **spice API 路径注意**（v1.5.0）：**正确**是 `https://mp.toutiao.com/spice/image?upload_source=20020002&aid=1231&device_platform=web`，**错误**（404）是 `/mp/agw/article_material/photo/spice/image`。注意 `upload_source=20020002`（正文用），封面上传是 `20020003`
 14. **fetch spice API 必须在浏览器里**（v1.5.0）：用 page.evaluate 在浏览器上下文 fetch，带 credentials: include。从 Python 端 requests 调会缺 cookie 凭证失败
-15. **封面失败不阻断（v1.5.1）**：`.article-cover-add` 选择器不稳定（有时被 AI 抽屉遮挡），封面上传失败时 try/except 捕获后继续流程。**头条系统兜底**：自动从正文配图里挑第一张作为封面。策略建议：正文第一张配图就按封面风格设计（带标题文字、信息密度高），这样即使封面上传步骤失败，头条自动选的图也够用
+15. **封面失败不阻断（v1.5.1→v1.6.0）**：v1.5.1 时 `.article-cover-add` 选择器不稳定导致封面上传经常失败，只能靠头条系统兜底（自动用正文首图）。v1.6.0 改为 API直传+React注入方案，绕过UI选择器，封面上传成功率大幅提升。仍保留三级降级：API注入 → UI方案 → 正文首图兜底
+16. **封面真实UI流程（v1.6.1 核心改进，v1.6.0 React注入被废弃）**：
+    - **v1.6.0 问题**：React fiber `onChange(string)` 注入看起来成功，预览图也显示了，但**草稿箱里保存的是正文配图1，不是自定义封面**！自动保存时头条用的是另一套state，React注入只更新了UI临时state
+    - **用户手动操作经验**（v1.6.1 突破口）：手动上传封面时必须先删除自动提取的封面（来自正文配图），否则自定义封面不显示
+    - **新方案（v1.6.1 验证可行）**：
+      1. `_clear_auto_covers`：找 `<i class="article-cover-delete">` 删除按钮（一个空文本i元素，className含"delete"），点击删除所有自动提取的封面
+      2. 点击 `.article-cover-add` 打开抽屉 `.byte-drawer.mp-ic-img-drawer`
+      3. **切tab**（关键！）：点 `.byte-tabs-header-title:has-text("上传图片")`，从"正文图片"切到"上传图片"，file input 才出现
+      4. `set_input_files` 上传封面图
+      5. 等"已上传"提示
+      6. 点 `.byte-drawer-footer button.btn-primary` 确定
+    - **v1.6.1 测试结果**：自动保存7秒就"成功"（之前v1.6.0是30秒"保存中"），草稿箱封面ID = 上传图片ID = 自定义封面
+    - **降级链**：清除+UI → API+React注入（仅UI显示）→ 头条系统兜底（正文首图）
+17. **`--browser-data` 参数支持小号测试**（v1.6.1 新增）：用独立浏览器数据目录登录小号，避免主号被风控
+    - 主号：`--browser-data ~/.toutiao-browser-data`（默认）
+    - 小号：`--browser-data ~/.toutiao-browser-data-small`
+    - 用法：先 `python toutiao_publisher.py --browser-data ~/.toutiao-browser-data-small login` 扫码登录小号，再发布时同样带 `--browser-data`
 
 ## 关于作者
 
